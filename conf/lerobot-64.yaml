@@ -1,0 +1,20 @@
+defaults:
+  - bridge-64-light  # inherit all parameters from the standard 64-px preset
+  - _self_
+
+# -----------------------------------------------------------------------------
+# Overrides specific to running the GRP model on a LeRobot dataset
+# -----------------------------------------------------------------------------
+
+# Which dataset to pull from the Hugging Face hub (or a local mirror via the
+# `data.root` option).  Feel free to change this to any other LeRobot repo.
+dataset: lerobot/aloha_mobile_cabinet
+
+# Section used by data_adapter.load_dataset
+data:
+  kind: lerobot              # <- switch the data loader branch
+  repo_id: ${dataset}        # reuse the dataset string above
+  camera_key: null           # by default take the first camera in metadata
+  delta_ts: {}               # can be e.g. {observation.images.cam_high: [-1,0]}
+  root: null                 # path to local cache, defaults to ~/.cache/…
+  local_files: false         # set true to avoid network calls and stay offline 
