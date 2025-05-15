@@ -10,16 +10,37 @@ import numpy as np
 from tqdm import tqdm, trange
 import cv2
 
+# ---------------------------------------------------------------------------
+# Local helper that transparently loads either an X-Embodiment or a LeRobot
+# dataset.  Because this file may be launched from the repository root, we add
+# its directory to sys.path so that `data_adapter.py` is importable.
+# ---------------------------------------------------------------------------
+
+import os, sys
+sys.path.append(os.path.dirname(__file__))
+from data_adapter import load_dataset
 
 # data loading
 def get_batch_grp(split, dataset, batch_size):
-    # generate a small batch of inputs x and targets y
+    """Sample a random mini-batch from *dataset* without redundant copies.
+
+    The dict entries inside ``dataset['train' / 'test']`` are already torch
+    tensors (created in ``data_adapter`` + preprocessing).  We therefore slice
+    directly instead of re-wrapping them with ``torch.tensor`` which triggered
+    warnings and unnecessary memory transfers.
+    """
     data = dataset['train'] if split == 'train' else dataset['test']
-    ix = np.random.randint(int(len(data["img"])), size=(batch_size,))
-    x = torch.tensor(data["img"][ix], dtype=torch.float)
-    x_goal = torch.tensor(data["goal"][ix], dtype=torch.long)
-    x_goal_img = torch.tensor(data["goal_img"][ix], dtype=torch.float)
-    y = torch.tensor(data["action"][ix], dtype=torch.float)
+
+    total = data["img"].shape[0]
+    # draw indices on CPU for simplicity then convert to Python list for
+    # advanced indexing (works for tensors on any device)
+    ix = np.random.randint(total, size=batch_size).tolist()
+
+    x        = data["img"][ix].float()
+    x_goal   = data["goal"][ix].long()
+    x_goal_img = data["goal_img"][ix].float()
+    y        = data["action"][ix].float()
+
     return x, x_goal, x_goal_img, y
 
 
@@ -206,8 +227,7 @@ class GRP(nn.Module):
 import hydra, json
 from omegaconf import DictConfig, OmegaConf
 
-# @hydra.main(config_path="conf", config_name="grp-mini")
-@hydra.main(config_path="./conf", config_name="bridge-64-light")
+@hydra.main(version_base=None, config_path="./conf", config_name="bridge-64-light")
 def my_main(cfg: DictConfig):
     torch.manual_seed(cfg.r_seed)
     log_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
@@ -215,33 +235,36 @@ def my_main(cfg: DictConfig):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("Using device: ", device, f"({torch.cuda.get_device_name(device)})" if torch.cuda.is_available() else "")
     cfg.device = device
-    from datasets import load_dataset, load_from_disk
 
-    dataset = load_dataset(cfg.dataset, split='train')
-    print('Features:', dataset.features)
+    # ------------------------------------------------------------------
+    # Load dataset (X-Embodiment by default, LeRobot when cfg.data.kind = "lerobot")
+    # This returns the same dictionary layout that the original code used,
+    # keeping everything that follows unchanged.
+    # ------------------------------------------------------------------
+    dataset_tmp = load_dataset(cfg)
 
-    dataset_tmp = {
-        "img": np.array(dataset["img"]),
-        "action": np.concatenate((np.array(dataset["action"]) 
-                                ,np.array(dataset["rotation_delta"])
-                                ,np.array(dataset["open_gripper"])
-                                ), axis=1),
-        "goal_img": np.array(dataset["goal_img"]),
-        "goal": dataset["goal"]
-    }
-    shortest_text_len = min([len(txt) for txt in dataset["goal"]])
+    # ------------------------------------------------------------------
+    # Text (goal) processing – ensure we always have at least one token so
+    # that nn.Embedding(vocab_size, …) is well-defined.
+    # ------------------------------------------------------------------
+
+    shortest_text_len = min(len(txt) for txt in dataset_tmp["goal"])
+    if shortest_text_len == 0:
+        shortest_text_len = 1  # guarantee at least one column
     cfg.block_size = shortest_text_len
 
     # here are all the unique characters that occur in this text
-    chars = sorted(list(set([item for row in dataset_tmp["goal"] for item in row]))) ## Flatten to a long string
+    chars = sorted(list(set([item for row in dataset_tmp["goal"] for item in row])))  # flatten
+    if len(chars) == 0:
+        chars = ["_"]  # placeholder token when text is missing
     cfg.vocab_size = len(chars)
     # create a mapping from characters to integers
     stoi = { ch:i for i,ch in enumerate(chars) }
     itos = { i:ch for i,ch in enumerate(chars) }
-    encode_txt = lambda s: [stoi[c] for c in s] # text encoder to tokens: 
+    encode_txt = lambda s: [stoi[c] for c in s]  # text → list[int]
     decode_txy = lambda l: ''.join([itos[i] for i in l]) # token decoder to text: 
     print("vocab_size:", cfg.vocab_size)
-    print("example text encode:", encode_txt(dataset_tmp["goal"][0]))
+    print("example text encode:", encode_txt(dataset_tmp["goal"][0] if len(dataset_tmp["goal"]) > 0 else ""))
 
     if cfg.load_action_bounds == True:
         a_std, a_mean = cfg.env.action_std, cfg.env.action_mean
@@ -256,11 +279,20 @@ def my_main(cfg: DictConfig):
     resize_state = lambda sf:   cv2.resize(np.array(sf, dtype=np.float32), (cfg.image_shape[0], cfg.image_shape[1]))  # resize state
     decode_action = lambda binN: (binN * a_std) + a_mean  # Undo mapping to [-1, 1]
 
+    def encode_goal_str(g: str):
+        tokens = encode_txt(g[: cfg.block_size])
+        # pad / truncate
+        if len(tokens) < cfg.block_size:
+            tokens = tokens + [0] * (cfg.block_size - len(tokens))
+        elif len(tokens) > cfg.block_size:
+            tokens = tokens[: cfg.block_size]
+        return tokens
+
     dataset_tmp = {
         "img": torch.tensor(encode_state(dataset_tmp["img"])).to(device),
-        "action": torch.tensor(encode_action(dataset_tmp["action"]), dtype=torch.float).to(device),            
+        "action": torch.tensor(encode_action(dataset_tmp["action"]), dtype=torch.float).to(device),
         "goal_img": torch.tensor(encode_state(dataset_tmp["goal_img"])).to(device),
-        "goal": torch.tensor([encode_txt(goal[:cfg.block_size]) for goal in dataset_tmp["goal"]]).to(device)
+        "goal": torch.tensor([encode_goal_str(goal) for goal in dataset_tmp["goal"]]).to(device),
     }
 
     print("Dataset shape:", len(dataset_tmp["img"]))
