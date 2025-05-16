@@ -9,6 +9,7 @@ import tensorflow_datasets as tfds
 import numpy as np
 from tqdm import tqdm, trange
 import cv2
+import time
 
 # ---------------------------------------------------------------------------
 # Local helper that transparently loads either an X-Embodiment or a LeRobot
@@ -266,13 +267,46 @@ def my_main(cfg: DictConfig):
     print("vocab_size:", cfg.vocab_size)
     print("example text encode:", encode_txt(dataset_tmp["goal"][0] if len(dataset_tmp["goal"]) > 0 else ""))
 
-    if cfg.load_action_bounds == True:
+    # ---------------------------------------------------------------
+    # Action normalisation: if the preset bounds do not match the
+    # dimensionality of the dataset, recompute them automatically.
+    # ---------------------------------------------------------------
+
+    action_dim_dataset = dataset_tmp["action"].shape[1]
+
+    if cfg.load_action_bounds and len(cfg.env.action_mean) != action_dim_dataset:
+        print("[warning] cfg.env.action_mean/std have length", len(cfg.env.action_mean),
+              "but dataset has", action_dim_dataset, "action dims. Recomputing bounds from data.")
+        cfg.load_action_bounds = False  # fall through to data-driven stats
+
+    if cfg.load_action_bounds:
         a_std, a_mean = cfg.env.action_std, cfg.env.action_mean
-        a_std[6] = cfg.env.gripper_closed_std
+        # make sure the list length matches; pad/trim if necessary
+        if len(a_std) < action_dim_dataset:
+            a_std = a_std + [a_std[-1]] * (action_dim_dataset - len(a_std))
+        a_std = a_std[:action_dim_dataset]
+        if len(a_mean) < action_dim_dataset:
+            a_mean = a_mean + [0.0] * (action_dim_dataset - len(a_mean))
+        a_mean = a_mean[:action_dim_dataset]
+        # optional gripper std fix if index exists
+        if action_dim_dataset >= 7:
+            a_std[6] = cfg.env.gripper_closed_std
     else:
-        a_std, a_mean = (dataset_tmp["action"].std(axis=0) + 0.001) * 1.5, dataset_tmp["action"].mean(axis=0)
+        import time
+        n_frames = dataset_tmp["action"].shape[0]
+        print(f"[normalization] Computing action mean/std over {n_frames} frames...", flush=True)
+        t0 = time.time()
+        a_std = (dataset_tmp["action"].std(axis=0) + 0.001) * 1.5
+        a_mean = dataset_tmp["action"].mean(axis=0)
+        dt = time.time() - t0
+        # Show a quick preview of the first few dims so user sees progress
+        preview_dims = min(5, len(a_mean))
+        print(f"[normalization] Done in {dt:.2f}s. First {preview_dims} dims mean: "
+              f"{a_mean[:preview_dims]}, std: {a_std[:preview_dims]}", flush=True)
+
+    # define encoder once we have a_mean/a_std
     cfg.action_bins = len(a_mean)
-    encode_action = lambda af:   (((af - a_mean)/(a_std))).astype(np.float32) # encoder: take a float, output an integer
+    encode_action = lambda af: (((af - a_mean) / (a_std))).astype(np.float32)
 
     ## Get the actions and encode them to map to [-1, 1]
     encode_state = lambda af:   ((af/(255.0)*2.0)-1.0).astype(np.float32) # encoder: take a float, output an integer
@@ -328,6 +362,25 @@ def my_main(cfg: DictConfig):
             del env
         env = simpler_env.make(task_name)
         env_unwrapped = env.env.env.env ## Updated gymnasium wrapper adds lots of wrappers.
+
+    # ------------------------------------------------------------------
+    # Checkpoint directory and helper
+    # ------------------------------------------------------------------
+
+    run_dir = log_dir  # hydra runtime dir
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    def save_checkpoint(step:int):
+        ckpt_path = os.path.join(ckpt_dir, f"step_{step:07d}.pt")
+        torch.save({
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "a_mean": a_mean,
+            "a_std": a_std,
+            "cfg": OmegaConf.to_container(cfg, resolve=True)
+        }, ckpt_path)
+        print(f"[checkpoint] Saved checkpoint to {ckpt_path}", flush=True)
 
     for iter in range(cfg.max_iters):
 
@@ -388,6 +441,14 @@ def my_main(cfg: DictConfig):
         if (iter + 1) % cfg.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+        # periodic checkpointing (after optimisation step for correct states)
+        if (iter + 1) % cfg.save_interval == 0:
+            save_checkpoint(iter + 1)
+
+    # Save final checkpoint regardless of testing flag
+    if cfg.save_interval > 0:
+        save_checkpoint(cfg.max_iters)
 
     if not cfg.testing:
         wandb.finish()

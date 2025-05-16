@@ -5,11 +5,12 @@ defaults:
 
 hydra:
   launcher: 
-    gres: gpu:a100 # 
+  #I have a (NVIDIA RTX 5000 Ada Generation Laptop GPU with 64GB of system ram and 16GB of VRAM and 32 cores (64 threads))
+    gres: gpu:rtx5000
     # gpus-per-task: rtx8000:1
-    mem_gb: 32
+    mem_gb: 64
     tasks_per_node: 1
-    cpus_per_task: 8
+    cpus_per_task: 32
     array_parallelism: 3 # I think this means run per job.
     additional_parameters:
       time: 0-03:00:00                               # maximum wall time allocated for the job (D-H:MM:SS)
@@ -35,6 +36,7 @@ testing: true
 simEval: false
 eval_vid_iters: 1000
 gradient_accumulation_steps: 2
+save_interval: 100  # iterations between automatic checkpoints
 
 # ------------
 

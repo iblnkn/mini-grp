@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import torch
 from typing import Dict, Any
+import os, hashlib, json
 
 
 def _load_xembod_dataset(cfg) -> Dict[str, Any]:
@@ -69,9 +70,40 @@ def _load_lerobot_dataset(cfg) -> Dict[str, Any]:
 
     H, W, _ = cfg.image_shape
 
+    # ------------------------------------------------------------------
+    # 1. Build cache path.  Cache key depends on repo id, camera key, image
+    #    resolution and optional trim.  We also append dataset total_frames
+    #    to detect updates on the hub.
+    # ------------------------------------------------------------------
+
+    cache_root = os.path.expanduser("~/.cache/mini-grp")
+    os.makedirs(cache_root, exist_ok=True)
+
+    meta_key = f"{repo_id}|{cam_key}|{H}x{W}|trim={getattr(cfg,'trim',None)}|frames={len(lr_dataset)}"
+    cache_name = hashlib.md5(meta_key.encode()).hexdigest() + ".npz"
+    cache_path = os.path.join(cache_root, cache_name)
+
+    if os.path.exists(cache_path) and not getattr(cfg.data, "rebuild_cache", False):
+        print(f"[cache] Loading pre-processed tensors from {cache_path}")
+        cached = np.load(cache_path)
+        dataset_tmp = {
+            "img": cached["img"],
+            "goal_img": cached["goal_img"],
+            "goal": list(cached["goal"]),
+            "action": cached["action"],
+        }
+        return dataset_tmp
+
     imgs, goal_imgs, actions, goals = [], [], [], []
 
-    for sample in lr_dataset:
+    # optional: respect cfg.trim to speed-up experiments / testing runs
+    trim = getattr(cfg, "trim", None)
+    total_iter = len(lr_dataset) if trim is None else min(trim, len(lr_dataset))
+
+    from tqdm import tqdm
+    for i, sample in enumerate(tqdm(lr_dataset, total=total_iter, desc="[lerobot] loading frames")):
+        if trim is not None and i >= trim:
+            break
         # ---------- image processing ----------
         img_t = sample[cam_key]  # (C, H, W) torch tensor
         img_np = img_t.permute(1, 2, 0).cpu().numpy()  # to (H, W, C)
@@ -100,6 +132,16 @@ def _load_lerobot_dataset(cfg) -> Dict[str, Any]:
         "goal": goals,  # list[str]
         "action": np.stack(actions),
     }
+
+    # ------------------------------------------------------------------
+    #  Save compressed cache for next runs
+    # ------------------------------------------------------------------
+    try:
+        np.savez_compressed(cache_path, **dataset_tmp)
+        print(f"[cache] Saved processed dataset to {cache_path}")
+    except Exception as e:
+        print("[cache] Warning: failed to save cache:", e)
+
     return dataset_tmp
 
 

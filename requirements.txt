@@ -5,7 +5,7 @@ dm-reverb
 moviepy==1.0.3
 numpy==1.26.4
 pandas==2.2.1
-opencv-python ## for cv2
+# opencv-python ## for cv2
 tensorflow==2.15.0
 tensorflow_datasets==4.9.2
 moviepy>=1.0.3
